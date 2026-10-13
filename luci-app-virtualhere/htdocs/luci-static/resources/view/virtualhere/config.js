@@ -285,14 +285,7 @@ return view.extend({
 		this.pendingAction = action;
 		++this.statusRequest;
 		this.updateButtons();
-		return callAction(action).then(checked).then(() => {
-			const messages = {
-				start: _('VirtualHere started.'),
-				stop: _('VirtualHere stopped.'),
-				restart: _('VirtualHere restarted.')
-			};
-			ui.addNotification(null, E('p', {}, messages[action]), 'info');
-		}).finally(() => this.finishOperation());
+		return callAction(action).then(checked).finally(() => this.finishOperation());
 	},
 
 	render: function(data) {
