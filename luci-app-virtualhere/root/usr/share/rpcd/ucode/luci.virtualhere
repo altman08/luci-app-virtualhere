@@ -12,7 +12,8 @@ function settings() {
 	return {
 		binary_path: uci.get('virtualhere', 'main', 'binary_path') ?? '/usr/bin/vhusbd',
 		config_path: uci.get('virtualhere', 'main', 'config_path') ?? '/etc/vhusbd.conf',
-		autostart: system([init, 'enabled'], 2000) == 0 ? '1' : '0'
+		enabled: uci.get('virtualhere', 'main', 'enabled') ??
+			uci.get('virtualhere', 'main', 'autostart') ?? '0'
 	};
 }
 
@@ -31,10 +32,13 @@ function state() {
 		return { error: 'service_unavailable' };
 	let instances = result.vhusbd?.instances ?? {};
 	let pids = [];
-	for (let name, instance in instances)
-		if (instance.running && instance.pid)
-			push(pids, instance.pid);
-	return { running: length(pids) > 0, active: length(instances) > 0, pids };
+	let running = false;
+	for (let name, instance in instances) {
+		if (!instance.running) continue;
+		running = true;
+		if (instance.pid) push(pids, instance.pid);
+	}
+	return { running, active: length(instances) > 0, pids };
 }
 
 function binary_error(path) {
@@ -66,7 +70,7 @@ function read_config() {
 }
 
 function stop_and_wait(before) {
-	if (system([init, 'stop'], 8000) != 0)
+	if (system([init, 'stop_now'], 8000) != 0)
 		return false;
 	// procd may return before SIGTERM/SIGKILL has reaped the previous process.
 	for (let i = 0; i < 60; i++) {
@@ -112,7 +116,7 @@ function write_config(args) {
 	let before = state();
 	if (before.error) return before;
 	if (before.active && !args.apply) return { error: 'stop_before_save' };
-	if (before.active && binary_error(config.binary_path))
+	if (args.apply && config.enabled == '1' && binary_error(config.binary_path))
 		return { error: binary_error(config.binary_path) };
 	if (before.active && !stop_and_wait(before)) return { error: 'stop_failed' };
 	let tempdir, tempfile, file;
@@ -143,7 +147,12 @@ function write_config(args) {
 	file?.close();
 	if (tempfile) fs.unlink(tempfile);
 	if (tempdir) fs.rmdir(tempdir);
-	if (before.active && system([init, 'start'], 8000) != 0)
+	// A successful apply follows enabled; a failed write restores even a
+	// temporarily started service without changing its persistent setting.
+	let should_start = result.saved && args.apply ? config.enabled == '1' : before.active;
+	if (should_start && binary_error(config.binary_path))
+		return { error: binary_error(config.binary_path), saved: result.saved ?? false };
+	if (should_start && system([init, 'start_now'], 12000) != 0)
 		return { error: 'start_failed', saved: result.saved ?? false };
 	return result;
 }
@@ -154,37 +163,41 @@ const methods = {
 		call: () => {
 			let config = settings();
 			let result = state();
+			result.enabled = config.enabled;
 			result.binary_error = binary_error(config.binary_path);
 			return result;
 		}
 	},
 	read_config: { call: () => read_config() },
 	save_settings: {
-		args: { binary_path: '', config_path: '', autostart: '', apply: false },
+		args: { binary_path: '', config_path: '', enabled: '', apply: false },
 		call: request => locked(() => {
 			let args = request.args;
 			if (!valid_path(args.binary_path) || !valid_path(args.config_path) ||
-				(args.autostart != '0' && args.autostart != '1')) return { error: 'invalid_path' };
+				(args.enabled != '0' && args.enabled != '1')) return { error: 'invalid_path' };
 			let config_target = fs.realpath(args.config_path);
 			if (args.binary_path == args.config_path || config_target == '/etc/config/virtualhere' ||
 				(config_target && config_target == fs.realpath(args.binary_path)))
 				return { error: 'same_path' };
 			let before = state();
 			if (before.error) return before;
-			if (args.apply && before.active && binary_error(args.binary_path))
+			if (args.apply && args.enabled == '1' && binary_error(args.binary_path))
 				return { error: binary_error(args.binary_path) };
 			let uci = cursor();
 			uci.set('virtualhere', 'main', 'virtualhere');
 			uci.set('virtualhere', 'main', 'binary_path', args.binary_path);
 			uci.set('virtualhere', 'main', 'config_path', args.config_path);
-			uci.set('virtualhere', 'main', 'autostart', args.autostart);
+			uci.set('virtualhere', 'main', 'enabled', args.enabled);
+			uci.delete('virtualhere', 'main', 'autostart');
 			if (!uci.commit('virtualhere')) return { error: 'settings_failed' };
-			if (system([init, args.autostart == '1' ? 'enable' : 'disable'], 2000) != 0)
-				return { error: 'autostart_failed' };
-			if (args.apply && before.active) {
-				if (system([init, 'check'], 2000) != 0) return { error: 'config_invalid' };
-				if (!stop_and_wait(before)) return { error: 'stop_failed' };
-				if (system([init, 'start'], 8000) != 0) return { error: 'start_failed' };
+			if (system([init, 'enable'], 2000) != 0)
+				return { error: 'autostart_failed', saved: true };
+			if (args.apply) {
+				if (args.enabled == '1' && system([init, 'check'], 2000) != 0)
+					return { error: 'config_invalid', saved: true };
+				if (!stop_and_wait(before)) return { error: 'stop_failed', saved: true };
+				if (args.enabled == '1' && system([init, 'start_now'], 12000) != 0)
+					return { error: 'start_failed', saved: true };
 			}
 			return { saved: true };
 		})
@@ -207,7 +220,7 @@ const methods = {
 			let before = state();
 			if (before.error) return before;
 			if (action != 'start' && !stop_and_wait(before)) return { error: 'stop_failed' };
-			if (action != 'stop' && system([init, 'start'], 8000) != 0)
+			if (action != 'stop' && system([init, 'start_now'], 12000) != 0)
 				return { error: 'start_failed' };
 			return { success: true };
 		})

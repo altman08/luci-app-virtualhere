@@ -11,7 +11,7 @@ const callStatus = rpc.declare({ object: 'luci.virtualhere', method: 'status' })
 const callRead = rpc.declare({ object: 'luci.virtualhere', method: 'read_config' });
 const callSaveSettings = rpc.declare({
 	object: 'luci.virtualhere', method: 'save_settings',
-	params: [ 'binary_path', 'config_path', 'autostart', 'apply' ]
+	params: [ 'binary_path', 'config_path', 'enabled', 'apply' ]
 });
 const callWrite = rpc.declare({
 	object: 'luci.virtualhere', method: 'write_config',
@@ -49,7 +49,7 @@ function checked(reply) {
 	if (reply.error) {
 		let message = errors[reply.error] || reply.error;
 		if (reply.saved)
-			message += ' ' + _('The file was saved, but restoring the service failed.');
+			message += ' ' + _('Changes were saved, but applying the service settings failed.');
 		if (reply.detail)
 			message += ' ' + reply.detail;
 		throw new Error(message);
@@ -57,8 +57,17 @@ function checked(reply) {
 	return reply;
 }
 
+function loadStylesheet() {
+	const id = 'virtualhere-view-stylesheet';
+	if (document.getElementById(id))
+		return;
+	const link = E('link', { id, rel: 'stylesheet', href: L.resource('view/virtualhere/config.css') });
+	document.head.appendChild(link);
+}
+
 return view.extend({
 	load: function() {
+		loadStylesheet();
 		return Promise.all([ callSettings(), callStatus(), callRead() ]);
 	},
 
@@ -88,15 +97,34 @@ return view.extend({
 			const item = this.serviceButtons[action];
 			const disabled = this.busy || this.map.readonly || unavailable ||
 				(action === 'start' && status.running) ||
-				(action === 'stop' && !status.active) ||
-				(action !== 'stop' && !!status.binary_error);
+				(action !== 'start' && !status.running);
 			item.button.disabled = !!disabled;
-			item.button.className = 'btn cbi-button' + (disabled ? '' : ' ' + item.style);
+			item.button.className = 'cbi-button ' + item.style;
 		});
 		dom.content(this.controlHint, this.map.readonly ? _('Your account has read-only access. Service control is unavailable.') :
 			unavailable ? _('Unable to query the service manager.') :
 			status.binary_error ? _('Install the server executable at the configured path and grant execution permission before starting.') :
-			_('Service actions use saved settings. The page footer saves basic settings only.'));
+			_('Service actions use saved settings without changing Enable. Save & Apply starts or stops the service according to Enable. The page footer saves basic settings only.'));
+	},
+
+	renderStatus: function(status) {
+		if (status.error) {
+			dom.content(this.statusNode, E('span', { 'class': 'label warning' }, errors[status.error] || status.error));
+			return;
+		}
+		const enabled = status.enabled === '1';
+		if (!enabled && !status.running) {
+			dom.content(this.statusNode, [
+				E('span', { 'class': 'label warning' }, _('Not enabled')),
+				E('span', { 'class': 'virtualhere-status-meta' }, _('The service is not running'))
+			]);
+			return;
+		}
+		dom.content(this.statusNode, [
+			E('span', { 'class': status.running ? (enabled ? 'label success' : 'label warning') : 'label' },
+				status.running ? (enabled ? _('Running') : _('Running (not enabled)')) : _('Stopped')),
+			E('span', { 'class': 'virtualhere-status-meta' }, _('PID: %s').format(status.pids.length ? status.pids.join(', ') : '-'))
+		]);
 	},
 
 	refreshStatus: function() {
@@ -105,9 +133,7 @@ return view.extend({
 			if (request !== this.statusRequest)
 				return;
 			this.serviceStatus = status;
-			dom.content(this.statusNode, status.error ? errors[status.error] || status.error :
-				status.running ? _('Running') : status.active ? _('Not running (service is registered)') : _('Stopped'));
-			this.statusNode.style.color = status.error ? '' : status.running ? 'green' : 'red';
+			this.renderStatus(status);
 			dom.content(this.checkNode, status.binary_error ? (errors[status.binary_error] || status.binary_error) + ' ' + this.settings.binary_path :
 				_('File check passed: the executable exists, is non-empty and has execution permission. Architecture and startup are not verified.'));
 			this.checkNode.style.color = status.binary_error ? 'red' : 'green';
@@ -115,8 +141,7 @@ return view.extend({
 			if (request !== this.statusRequest)
 				return;
 			this.serviceStatus = { error: 'service_unavailable' };
-			dom.content(this.statusNode, error.message);
-			this.statusNode.style.color = '';
+			this.renderStatus({ error: error.message });
 			dom.content(this.checkNode, _('Unable to query the service manager.'));
 			this.checkNode.style.color = '';
 		}).finally(() => this.updateButtons());
@@ -138,6 +163,11 @@ return view.extend({
 		const content = this.editor.value;
 		if (new TextEncoder().encode(content).length > 16384)
 			return Promise.reject(new Error(errors.too_large));
+		if (this.busy || this.map.readonly)
+			return Promise.resolve();
+		this.busy = true;
+		++this.statusRequest;
+		this.updateButtons();
 		return callWrite(this.file.path, content, this.file.content, this.file.exists, apply)
 			.then(reply => {
 				if (reply.saved) {
@@ -147,34 +177,53 @@ return view.extend({
 				}
 				checked(reply);
 				ui.addNotification(null, E('p', {}, _('Configuration file saved.')), 'info');
-				return this.refreshStatus();
-			});
+			}).finally(() => this.refreshStatus().finally(() => {
+				this.busy = false;
+				this.updateButtons();
+			}));
 	},
 
 	saveSettings: function(apply) {
 		const pathChanged = this.options.config_path.formvalue('main') !== this.settings.config_path;
 		if (pathChanged && this.fileDirty())
 			return Promise.reject(new Error(_('Save or discard file edits before changing the configuration path.')));
+		if (this.busy || this.map.readonly)
+			return Promise.resolve();
+		this.busy = true;
+		++this.statusRequest;
+		this.updateButtons();
 		// Parse only; keeping the existing DOM preserves unsaved file contents.
 		return this.map.parse().then(() => {
 			const data = this.map.data.get('json', 'main');
-			return callSaveSettings(data.binary_path, data.config_path, data.autostart, apply);
-		}).then(checked).then(() => callSettings()).then(settings => {
-			this.settings = settings;
-			ui.addNotification(null, E('p', {}, _('Basic settings saved.')), 'info');
-			return pathChanged ? callRead().then(file => this.showFile(file)) : null;
-		}).then(() => this.refreshStatus());
+			return callSaveSettings(data.binary_path, data.config_path, data.enabled, apply);
+		}).then(reply => callSettings().then(settings => {
+			this.settings = checked(settings);
+			const reload = pathChanged && (reply.saved || !reply.error) ?
+				callRead().then(file => this.showFile(file)) : Promise.resolve();
+			return reload.then(() => {
+				checked(reply);
+				ui.addNotification(null, E('p', {}, _('Basic settings saved.')), 'info');
+			});
+		})).finally(() => this.refreshStatus().finally(() => {
+			this.busy = false;
+			this.updateButtons();
+		}));
 	},
 
 	serviceAction: function(action) {
 		if (this.busy || this.map.readonly || this.serviceButtons[action].button.disabled)
 			return Promise.resolve();
-		if (this.settingsDirty() || this.fileDirty())
-			return Promise.reject(new Error(_('Save or discard pending edits before controlling the service.')));
 		this.busy = true;
 		++this.statusRequest;
 		this.updateButtons();
-		return callAction(action).then(checked).finally(() => this.refreshStatus().finally(() => {
+		return callAction(action).then(checked).then(() => {
+			const messages = {
+				start: _('VirtualHere started.'),
+				stop: _('VirtualHere stopped.'),
+				restart: _('VirtualHere restarted.')
+			};
+			ui.addNotification(null, E('p', {}, messages[action]), 'info');
+		}).finally(() => this.refreshStatus().finally(() => {
 			this.busy = false;
 			this.updateButtons();
 		}));
@@ -194,13 +243,14 @@ return view.extend({
 		this.options = {};
 		const s = this.map.section(form.NamedSection, 'main', 'main');
 		s.addremove = false;
+		s.tab('status', _('Status and actions'));
 		s.tab('basic', _('Basic settings'));
 		s.tab('file', _('Configuration file'));
 
-		let o = s.taboption('basic', form.Flag, 'autostart', _('Start on boot'));
+		let o = s.taboption('status', form.Flag, 'enabled', _('Enable'));
 		o.default = '0';
 		o.rmempty = false;
-		this.options.autostart = o;
+		this.options.enabled = o;
 		for (const field of [
 			[ 'binary_path', _('Executable path'), '/usr/bin/vhusbd' ],
 			[ 'config_path', _('Configuration file path'), '/etc/vhusbd.conf' ]
@@ -211,30 +261,32 @@ return view.extend({
 			o.validate = (section, value) => /^\/[^\x00-\x1f\x7f]+$/.test(value) && !value.endsWith('/') ? true : errors.invalid_path;
 			this.options[field[0]] = o;
 		}
-		this.statusNode = E('span');
+		this.statusNode = E('div');
 		this.checkNode = E('span');
-		o = s.taboption('basic', form.DummyValue, '_status', _('Service status'));
+		o = s.taboption('status', form.DummyValue, '_status', _('Current status'));
 		o.renderWidget = () => this.statusNode;
-		o = s.taboption('basic', form.DummyValue, '_check', _('Executable check'));
+		o = s.taboption('status', form.DummyValue, '_check', _('Executable check'));
 		o.renderWidget = () => this.checkNode;
-		this.controlHint = E('p');
+		this.controlHint = E('div', { 'class': 'virtualhere-action-footer' });
 		const controls = [];
 		[
-			[ 'start', _('Start'), 'cbi-button-positive' ],
-			[ 'stop', _('Stop'), 'cbi-button-negative' ],
+			[ 'start', _('Start'), 'cbi-button-apply' ],
+			[ 'stop', _('Stop'), 'cbi-button-reset' ],
 			[ 'restart', _('Restart'), 'cbi-button-reload' ]
 		].forEach(action => {
 			const button = E('button', {
-				'class': 'btn cbi-button', type: 'button', disabled: true,
+				'class': 'cbi-button ' + action[2], type: 'button', disabled: true,
 				click: () => this.serviceAction(action[0]).catch(error => {
 					ui.addNotification(null, E('p', {}, error.message));
 				})
 			}, action[1]);
 			this.serviceButtons[action[0]] = { button: button, style: action[2] };
-			controls.push(button, ' ');
+			controls.push(button);
 		});
-		o = s.taboption('basic', form.DummyValue, '_actions', _('Service control'));
-		o.renderWidget = () => E('div', {}, [ ...controls, this.controlHint ]);
+		o = s.taboption('status', form.DummyValue, '_actions', _('Service control'));
+		o.renderWidget = () => E('div', {}, [
+			E('div', { 'class': 'virtualhere-action-group' }, controls), this.controlHint
+		]);
 
 		this.editor = E('textarea', {
 			'class': 'cbi-input-textarea', rows: 24, style: 'width:100%;font-family:monospace',
@@ -245,7 +297,7 @@ return view.extend({
 		o = s.taboption('file', form.DummyValue, '_editor', _('Configuration file contents'));
 		o.renderWidget = () => E('div', {}, [
 			this.filePath, this.fileHint,
-			E('p', {}, _('VirtualHere writes its configuration while running. Save & Apply stops the service before writing and restores it afterwards. Save requires a stopped service.')),
+			E('p', {}, _('VirtualHere writes its configuration while running. Save & Apply stops it before writing, then starts it only when Enable is saved as on. Save requires a stopped service.')),
 			this.editor,
 			E('div', { 'class': 'right' }, [
 				E('button', { 'class': 'cbi-button cbi-button-action', type: 'button', click: ui.createHandlerFn(this, 'reloadFile') }, _('Reload file')),
