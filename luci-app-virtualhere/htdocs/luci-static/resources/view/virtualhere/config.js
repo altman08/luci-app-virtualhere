@@ -9,6 +9,7 @@
 const callSettings = rpc.declare({ object: 'luci.virtualhere', method: 'settings' });
 const callStatus = rpc.declare({ object: 'luci.virtualhere', method: 'status' });
 const callRead = rpc.declare({ object: 'luci.virtualhere', method: 'read_config' });
+const callLogs = rpc.declare({ object: 'luci.virtualhere', method: 'logs' });
 const callSaveSettings = rpc.declare({
 	object: 'luci.virtualhere', method: 'save_settings',
 	params: [ 'binary_path', 'config_path', 'enabled', 'apply' ]
@@ -28,6 +29,7 @@ const errors = {
 	binary_permission: _('The executable has no execution permission.'),
 	service_unavailable: _('Unable to query the service manager.'),
 	read_failed: _('Unable to read the configuration file or its directory.'),
+	logs_failed: _('Unable to read the runtime log.'),
 	not_regular: _('The configuration path is not a regular file.'),
 	too_large: _('The configuration file must not exceed 16 KiB.'),
 	not_text: _('The configuration file must be text without NUL characters.'),
@@ -52,6 +54,8 @@ function checked(reply) {
 			message += ' ' + _('Changes were saved, but applying the service settings failed.');
 		if (reply.detail)
 			message += ' ' + reply.detail;
+		if (reply.restore_error)
+			message += ' ' + _('Restoring the previous service also failed: %s').format(errors[reply.restore_error] || reply.restore_error);
 		throw new Error(message);
 	}
 	return reply;
@@ -68,7 +72,11 @@ function loadStylesheet() {
 return view.extend({
 	load: function() {
 		loadStylesheet();
-		return Promise.all([ callSettings(), callStatus(), callRead() ]);
+		return Promise.all([
+			callSettings(),
+			L.resolveDefault(callStatus(), { error: 'service_unavailable' }),
+			L.resolveDefault(callRead(), { error: 'read_failed' })
+		]);
 	},
 
 	fileDirty: function() {
@@ -101,7 +109,15 @@ return view.extend({
 			item.button.disabled = !!disabled;
 			item.button.className = 'cbi-button ' + item.style;
 		});
+		Object.keys(this.fileButtons).forEach(action => {
+			this.fileButtons[action].disabled = !!(this.busy ||
+				(action !== 'reload' && (this.map.readonly || !this.file || this.file.error)));
+		});
+		this.editor.readOnly = !!(this.busy || this.map.readonly);
+		if (this.logRefresh)
+			this.logRefresh.disabled = !!(this.busy || this.logLoading);
 		dom.content(this.controlHint, this.map.readonly ? _('Your account has read-only access. Service control is unavailable.') :
+			this.busy && this.pendingAction === 'stop' ? _('Stopping VirtualHere; waiting for the process to exit…') :
 			unavailable ? _('Unable to query the service manager.') :
 			status.binary_error ? _('Install the server executable at the configured path and grant execution permission before starting.') :
 			_('Service actions use saved settings without changing Enable. Save & Apply starts or stops the service according to Enable. The page footer saves basic settings only.'));
@@ -127,13 +143,20 @@ return view.extend({
 		]);
 	},
 
-	refreshStatus: function() {
+	refreshStatus: function(force) {
+		if (this.busy && !force)
+			return Promise.resolve();
 		const request = ++this.statusRequest;
 		return callStatus().then(status => {
 			if (request !== this.statusRequest)
 				return;
 			this.serviceStatus = status;
 			this.renderStatus(status);
+			if (status.error) {
+				dom.content(this.checkNode, errors[status.error] || status.error);
+				this.checkNode.style.color = '';
+				return;
+			}
 			dom.content(this.checkNode, status.binary_error ? (errors[status.binary_error] || status.binary_error) + ' ' + this.settings.binary_path :
 				_('File check passed: the executable exists, is non-empty and has execution permission. Architecture and startup are not verified.'));
 			this.checkNode.style.color = status.binary_error ? 'red' : 'green';
@@ -147,15 +170,68 @@ return view.extend({
 		}).finally(() => this.updateButtons());
 	},
 
+	logsVisible: function() {
+		const tab = this.logNode && this.logNode.closest('[data-tab="logs"]');
+		return !!tab && this.logNode.isConnected && tab.getAttribute('data-tab-active') === 'true' && !document.hidden;
+	},
+
+	refreshLogs: function() {
+		if (this.busy || this.logLoading || !this.logsVisible())
+			return Promise.resolve();
+		this.logLoading = true;
+		this.logRefresh.disabled = true;
+		return callLogs().then(checked).then(reply => {
+			if (typeof reply.content !== 'string')
+				throw new Error(errors.logs_failed);
+			// A hidden panel has no scroll geometry; refresh it on the next opening.
+			if (!this.logsVisible())
+				return;
+			const follow = this.logContent === null ||
+				this.logNode.scrollTop + this.logNode.clientHeight >= this.logNode.scrollHeight - 4;
+			if (reply.content !== this.logContent) {
+				const scrollTop = this.logNode.scrollTop;
+				this.logContent = reply.content;
+				this.logNode.value = reply.content || _('No VirtualHere log entries.');
+				this.logNode.scrollTop = follow ? this.logNode.scrollHeight : scrollTop;
+			}
+			this.logHint.textContent = reply.truncated ? _('Only the most recent log entries are shown.') : '';
+			this.logHint.classList.remove('warning');
+		}).catch(() => {
+			// Keep the last successful snapshot and leave settings/file edits alone.
+			this.logHint.textContent = errors.logs_failed;
+			this.logHint.classList.add('warning');
+		}).finally(() => {
+			this.logLoading = false;
+			this.logRefresh.disabled = !!this.busy;
+		});
+	},
+
+	finishOperation: function() {
+		return this.refreshStatus(true).finally(() => {
+			this.busy = false;
+			this.pendingAction = null;
+			this.updateButtons();
+			return this.refreshLogs();
+		});
+	},
+
 	reloadFile: function() {
+		if (this.busy)
+			return Promise.resolve();
 		if (this.options.config_path.formvalue('main') !== this.settings.config_path)
 			return Promise.reject(new Error(errors.path_changed));
 		if (this.fileDirty() && !window.confirm(_('Discard unsaved file changes and reload?')))
 			return Promise.resolve();
-		return callRead().then(checked).then(file => this.showFile(file));
+		this.busy = true;
+		++this.statusRequest;
+		this.updateButtons();
+		return callRead().then(checked).then(file => this.showFile(file))
+			.finally(() => this.finishOperation());
 	},
 
 	saveFile: function(apply) {
+		if (this.busy || this.map.readonly)
+			return Promise.resolve();
 		if (!this.file || this.file.error)
 			return Promise.reject(new Error(_('Load a readable configuration file before saving.')));
 		if (this.options.config_path.formvalue('main') !== this.file.path)
@@ -163,8 +239,6 @@ return view.extend({
 		const content = this.editor.value;
 		if (new TextEncoder().encode(content).length > 16384)
 			return Promise.reject(new Error(errors.too_large));
-		if (this.busy || this.map.readonly)
-			return Promise.resolve();
 		this.busy = true;
 		++this.statusRequest;
 		this.updateButtons();
@@ -177,18 +251,15 @@ return view.extend({
 				}
 				checked(reply);
 				ui.addNotification(null, E('p', {}, _('Configuration file saved.')), 'info');
-			}).finally(() => this.refreshStatus().finally(() => {
-				this.busy = false;
-				this.updateButtons();
-			}));
+			}).finally(() => this.finishOperation());
 	},
 
 	saveSettings: function(apply) {
+		if (this.busy || this.map.readonly)
+			return Promise.resolve();
 		const pathChanged = this.options.config_path.formvalue('main') !== this.settings.config_path;
 		if (pathChanged && this.fileDirty())
 			return Promise.reject(new Error(_('Save or discard file edits before changing the configuration path.')));
-		if (this.busy || this.map.readonly)
-			return Promise.resolve();
 		this.busy = true;
 		++this.statusRequest;
 		this.updateButtons();
@@ -204,16 +275,14 @@ return view.extend({
 				checked(reply);
 				ui.addNotification(null, E('p', {}, _('Basic settings saved.')), 'info');
 			});
-		})).finally(() => this.refreshStatus().finally(() => {
-			this.busy = false;
-			this.updateButtons();
-		}));
+		})).finally(() => this.finishOperation());
 	},
 
 	serviceAction: function(action) {
 		if (this.busy || this.map.readonly || this.serviceButtons[action].button.disabled)
 			return Promise.resolve();
 		this.busy = true;
+		this.pendingAction = action;
 		++this.statusRequest;
 		this.updateButtons();
 		return callAction(action).then(checked).then(() => {
@@ -223,10 +292,7 @@ return view.extend({
 				restart: _('VirtualHere restarted.')
 			};
 			ui.addNotification(null, E('p', {}, messages[action]), 'info');
-		}).finally(() => this.refreshStatus().finally(() => {
-			this.busy = false;
-			this.updateButtons();
-		}));
+		}).finally(() => this.finishOperation());
 	},
 
 	render: function(data) {
@@ -237,15 +303,18 @@ return view.extend({
 			_('VirtualHere official download page') + '</a>');
 		this.map.readonly = !L.hasViewPermission();
 		this.serviceButtons = {};
-		this.serviceStatus = null;
+		this.fileButtons = {};
+		this.serviceStatus = data[1];
 		this.statusRequest = 0;
 		this.busy = false;
+		this.pendingAction = null;
 		this.options = {};
 		const s = this.map.section(form.NamedSection, 'main', 'main');
 		s.addremove = false;
 		s.tab('status', _('Status and actions'));
 		s.tab('basic', _('Basic settings'));
 		s.tab('file', _('Configuration file'));
+		s.tab('logs', _('Runtime log'));
 
 		let o = s.taboption('status', form.Flag, 'enabled', _('Enable'));
 		o.default = '0';
@@ -294,37 +363,71 @@ return view.extend({
 		});
 		this.filePath = E('code');
 		this.fileHint = E('p');
+		const fileControls = [
+			[ 'reload', _('Reload file'), 'cbi-button-action', () => this.reloadFile() ],
+			[ 'save', _('Save file'), 'cbi-button-save', () => this.saveFile(false) ],
+			[ 'apply', _('Save & Apply file'), 'cbi-button-apply', () => this.saveFile(true) ]
+		].map(([action, label, style, handler]) => {
+			const button = E('button', {
+				'class': 'cbi-button ' + style, type: 'button',
+				click: () => handler().catch(error => ui.addNotification(null, E('p', {}, error.message)))
+			}, label);
+			this.fileButtons[action] = button;
+			return button;
+		});
 		o = s.taboption('file', form.DummyValue, '_editor', _('Configuration file contents'));
 		o.renderWidget = () => E('div', {}, [
 			this.filePath, this.fileHint,
 			E('p', {}, _('VirtualHere writes its configuration while running. Save & Apply stops it before writing, then starts it only when Enable is saved as on. Save requires a stopped service.')),
 			this.editor,
-			E('div', { 'class': 'right' }, [
-				E('button', { 'class': 'cbi-button cbi-button-action', type: 'button', click: ui.createHandlerFn(this, 'reloadFile') }, _('Reload file')),
-				E('button', {
-					'class': 'cbi-button cbi-button-save', type: 'button', disabled: this.map.readonly || null,
-					click: ui.createHandlerFn(this, () => this.saveFile(false))
-				}, _('Save file')),
-				E('button', {
-					'class': 'cbi-button cbi-button-apply', type: 'button', disabled: this.map.readonly || null,
-					click: ui.createHandlerFn(this, () => this.saveFile(true))
-				}, _('Save & Apply file'))
-			])
+			E('div', { 'class': 'virtualhere-action-group' }, fileControls)
+		]);
+		this.logContent = null;
+		this.logLoading = false;
+		this.logNode = E('textarea', {
+			'class': 'cbi-input-textarea', readonly: '', rows: 18,
+			style: 'width:100%;font-family:monospace',
+			'aria-label': _('Runtime log'), spellcheck: 'false'
+		}, _('Logs have not been loaded.'));
+		this.logHint = E('p', { 'role': 'status' });
+		this.logRefresh = E('button', {
+			'class': 'cbi-button cbi-button-reload', type: 'button', click: () => this.refreshLogs()
+		}, _('Refresh'));
+		o = s.taboption('logs', form.DummyValue, '_logs');
+		o.renderWidget = () => E('div', { 'class': 'virtualhere-log-view' }, [
+			E('p', {}, _('Shows the latest 200 log lines. Refreshes every 5 seconds while this tab is open.')),
+			this.logNode, this.logHint,
+			E('div', { 'class': 'virtualhere-action-group' }, this.logRefresh)
 		]);
 		this.showFile(data[2]);
+		this.renderStatus(this.serviceStatus);
+		this.updateButtons();
 		window.addEventListener('beforeunload', event => {
 			if (this.fileDirty() || this.settingsDirty()) {
 				event.preventDefault();
 				event.returnValue = '';
 			}
 		});
-		poll.add(() => this.refreshStatus(), 5);
-		return this.map.render().then(node => this.refreshStatus().then(() => node));
+		poll.add(() => Promise.all([this.refreshStatus(), this.refreshLogs()]), 5);
+		return this.map.render().then(node => {
+			// Capture LuCI's non-bubbling event, including after a form reset.
+			node.addEventListener('cbi-tab-active', event => {
+				if (event.detail.tab === 'logs')
+					this.refreshLogs();
+			}, true);
+			return this.refreshStatus().then(() => {
+				// The restored active tab needs scroll geometry after insertion.
+				window.requestAnimationFrame(() => this.refreshLogs());
+				return node;
+			});
+		});
 	},
 
 	handleSave: function() { return this.saveSettings(false); },
 	handleSaveApply: function() { return this.saveSettings(true); },
 	handleReset: function() {
+		if (this.busy)
+			return Promise.resolve();
 		if ((this.fileDirty() || this.settingsDirty()) && !window.confirm(_('Discard all unsaved changes?')))
 			return Promise.resolve();
 		Object.keys(this.options).forEach(key => this.map.data.set('json', 'main', key, this.settings[key]));

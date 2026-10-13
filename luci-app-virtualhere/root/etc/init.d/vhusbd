@@ -116,13 +116,16 @@ stop_now() {
 	printf '%s\n' "$services" | grep -q '"vhusbd"[[:space:]]*:' || return 0
 	pids="$(printf '%s\n' "$services" | jsonfilter -e '@.vhusbd.instances.*.pid')"
 	stop || return 1
-	while [ "$attempt" -lt 60 ]; do
+	while :; do
 		pending=0
 		for pid in $pids; do
 			[ ! -d "/proc/$pid" ] || pending=1
 		done
 		[ "$pending" -eq 0 ] && return 0
-		sleep 0.1
+		[ "$attempt" -lt 6 ] || break
+		# Some BusyBox builds only support integer sleep arguments.
+		# Check once more after the last wait before reporting a timeout.
+		sleep 1 || return 1
 		attempt=$((attempt + 1))
 	done
 	fail "Unable to stop VirtualHere completely"

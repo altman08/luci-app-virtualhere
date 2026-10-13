@@ -151,6 +151,9 @@ msgstr "文件已读取，请使用下方按钮保存文件内容。"
 msgid "Changes were saved, but applying the service settings failed."
 msgstr "修改已保存，但应用服务设置失败。"
 
+msgid "Restoring the previous service also failed: %s"
+msgstr "恢复之前的服务也失败了：%s"
+
 msgid "Unable to lock VirtualHere settings."
 msgstr "无法锁定 VirtualHere 设置。"
 
@@ -196,5 +199,29 @@ msgstr "VirtualHere 已启动。"
 msgid "VirtualHere stopped."
 msgstr "VirtualHere 已停止。"
 
+msgid "Stopping VirtualHere; waiting for the process to exit…"
+msgstr "正在停止 VirtualHere，等待进程退出…"
+
 msgid "VirtualHere restarted."
 msgstr "VirtualHere 已重启。"
+
+msgid "Runtime log"
+msgstr "运行日志"
+
+msgid "Refresh"
+msgstr "刷新"
+
+msgid "Shows the latest 200 log lines. Refreshes every 5 seconds while this tab is open."
+msgstr "显示最近 200 行日志，打开此标签页时每 5 秒自动刷新。"
+
+msgid "Logs have not been loaded."
+msgstr "尚未读取日志。"
+
+msgid "No VirtualHere log entries."
+msgstr "暂无 VirtualHere 日志。"
+
+msgid "Only the most recent log entries are shown."
+msgstr "仅显示最近的日志记录。"
+
+msgid "Unable to read the runtime log."
+msgstr "无法读取运行日志。"

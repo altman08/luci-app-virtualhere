@@ -146,6 +146,9 @@ msgstr ""
 msgid "Changes were saved, but applying the service settings failed."
 msgstr ""
 
+msgid "Restoring the previous service also failed: %s"
+msgstr ""
+
 msgid "Unable to lock VirtualHere settings."
 msgstr ""
 
@@ -191,5 +194,29 @@ msgstr ""
 msgid "VirtualHere stopped."
 msgstr ""
 
+msgid "Stopping VirtualHere; waiting for the process to exit…"
+msgstr ""
+
 msgid "VirtualHere restarted."
+msgstr ""
+
+msgid "Runtime log"
+msgstr ""
+
+msgid "Refresh"
+msgstr ""
+
+msgid "Shows the latest 200 log lines. Refreshes every 5 seconds while this tab is open."
+msgstr ""
+
+msgid "Logs have not been loaded."
+msgstr ""
+
+msgid "No VirtualHere log entries."
+msgstr ""
+
+msgid "Only the most recent log entries are shown."
+msgstr ""
+
+msgid "Unable to read the runtime log."
 msgstr ""
